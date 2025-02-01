@@ -1,0 +1,10 @@
+{
+  "theme": "system",
+  "cssTheme": "Hulk",
+  "interfaceFontFamily": "AnonymicePro Nerd Font",
+  "textFontFamily": "Hack",
+  "baseFontSize": 21,
+  "baseFontSizeAction": true,
+  "monospaceFontFamily": "ComicShannsMono Nerd Font Mono",
+  "accentColor": "#87f359"
+}
