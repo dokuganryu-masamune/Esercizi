@@ -4468,6 +4468,7 @@ var toBlobURL = async (url, mimeType, progress = false, cb) => {
 // src/utils/RecordingProcessor.ts
 var import_obsidian = require("obsidian");
 var _RecordingProcessor = class {
+  // CD quality audio for better fidelity
   constructor(plugin, pluginData) {
     this.plugin = plugin;
     this.pluginData = pluginData;
@@ -4546,36 +4547,55 @@ var _RecordingProcessor = class {
       return [audioBlob];
     }
     try {
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
       const arrayBuffer = await audioBlob.arrayBuffer();
-      const audioData = await this.convertToFloat32Array(arrayBuffer);
-      const bytesPerSample = 4;
-      const samplesPerChunk = Math.floor(this.MAX_AUDIO_SIZE_BYTES / bytesPerSample);
-      const overlapSamples = this.CHUNK_OVERLAP_SECONDS * this.SAMPLE_RATE;
+      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+      const totalDuration = audioBuffer.duration;
+      const chunkDuration = Math.floor(totalDuration * (this.MAX_AUDIO_SIZE_BYTES / audioBlob.size));
       const chunks = [];
-      let start = 0;
-      while (start < audioData.length) {
-        const idealEnd = Math.min(start + samplesPerChunk, audioData.length);
-        let end = idealEnd;
-        const searchStart = Math.max(idealEnd - 1e3, start);
-        const searchEnd = Math.min(idealEnd + 1e3, audioData.length);
-        for (let i = searchStart; i < searchEnd; i++) {
-          if (Math.abs(audioData[i]) < 0.01 && Math.abs(audioData[i + 1]) < 0.01) {
-            end = i;
-            break;
-          }
-        }
-        const chunkStart = start > 0 ? start - overlapSamples : start;
-        const chunkData = audioData.slice(chunkStart, end);
-        const chunkBuffer = chunkData.buffer.slice(
-          chunkData.byteOffset,
-          chunkData.byteOffset + chunkData.byteLength
+      for (let startTime = 0; startTime < totalDuration; startTime += chunkDuration) {
+        const endTime = Math.min(startTime + chunkDuration + this.CHUNK_OVERLAP_SECONDS, totalDuration);
+        const chunkBuffer = audioContext.createBuffer(
+          audioBuffer.numberOfChannels,
+          Math.ceil((endTime - startTime) * audioBuffer.sampleRate),
+          audioBuffer.sampleRate
         );
-        chunks.push(new Blob([chunkBuffer], { type: audioBlob.type }));
-        start = end;
+        for (let channel = 0; channel < audioBuffer.numberOfChannels; channel++) {
+          const channelData = audioBuffer.getChannelData(channel);
+          const chunkData = chunkBuffer.getChannelData(channel);
+          const startSample = Math.floor(startTime * audioBuffer.sampleRate);
+          const endSample = Math.ceil(endTime * audioBuffer.sampleRate);
+          chunkData.set(channelData.subarray(startSample, endSample));
+        }
+        const chunk = await new Promise((resolve) => {
+          const source = audioContext.createBufferSource();
+          source.buffer = chunkBuffer;
+          const destination = audioContext.createMediaStreamDestination();
+          source.connect(destination);
+          const recorder = new MediaRecorder(destination.stream, {
+            mimeType: audioBlob.type
+          });
+          const chunks2 = [];
+          recorder.ondataavailable = (e) => {
+            if (e.data.size > 0)
+              chunks2.push(e.data);
+          };
+          recorder.onstop = () => {
+            resolve(new Blob(chunks2, { type: audioBlob.type }));
+          };
+          recorder.start();
+          source.start(0);
+          setTimeout(() => {
+            source.stop();
+            recorder.stop();
+          }, chunkBuffer.duration * 1e3);
+        });
+        chunks.push(chunk);
       }
+      await audioContext.close();
       return chunks;
     } catch (error) {
-      throw error;
+      return [audioBlob];
     }
   }
   async convertToFloat32Array(arrayBuffer) {
@@ -4634,13 +4654,13 @@ var _RecordingProcessor = class {
   }
   async saveAudioFile(audioBlob) {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const baseFileName = `recording-${timestamp}.wav`;
+    const baseFileName = `recording-${timestamp}.webm`;
     const folderPath = this.pluginData.recordingFolderPath || "";
     let fileName = baseFileName;
     let filePath = folderPath ? `${folderPath}/${fileName}` : fileName;
     let count = 1;
     while (await this.plugin.app.vault.adapter.exists(filePath)) {
-      fileName = `recording-${timestamp}-${count}.wav`;
+      fileName = `recording-${timestamp}-${count}.webm`;
       filePath = folderPath ? `${folderPath}/${fileName}` : fileName;
       count++;
     }
@@ -4697,13 +4717,60 @@ var _RecordingProcessor = class {
       throw error;
     }
   }
+  async concatenateAudioChunks(chunks) {
+    try {
+      const firstChunk = chunks[0];
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const processedChunks = [];
+      for (const chunk of chunks) {
+        try {
+          const arrayBuffer = await chunk.arrayBuffer();
+          const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+          const source = audioContext.createBufferSource();
+          source.buffer = audioBuffer;
+          const destination = audioContext.createMediaStreamDestination();
+          source.connect(destination);
+          const recorder = new MediaRecorder(destination.stream, {
+            mimeType: firstChunk.type
+          });
+          const processedData = await new Promise((resolve) => {
+            const chunks2 = [];
+            recorder.ondataavailable = (e) => {
+              if (e.data.size > 0)
+                chunks2.push(e.data);
+            };
+            recorder.onstop = () => {
+              resolve(new Blob(chunks2, { type: firstChunk.type }));
+            };
+            recorder.start();
+            source.start(0);
+            setTimeout(() => {
+              source.stop();
+              recorder.stop();
+            }, audioBuffer.duration * 1e3);
+          });
+          processedChunks.push(processedData);
+        } catch (error) {
+          processedChunks.push(chunk);
+        }
+      }
+      await audioContext.close();
+      return new Blob(processedChunks, { type: firstChunk.type });
+    } catch (error) {
+      return chunks[0];
+    }
+  }
   async processLargeAudioFile(audioBlob, shouldSaveAudio, audioFilePath, activeFile, cursorPosition) {
     const chunks = await this.splitAudioBlob(audioBlob);
     const allResults = [];
+    const chunkPaths = [];
     for (let i = 0; i < chunks.length; i++) {
       try {
         const chunk = chunks[i];
-        const chunkPath = audioFilePath || (shouldSaveAudio ? await this.saveAudioFile(chunk) : "");
+        const chunkPath = audioFilePath ? `${audioFilePath}.part${i}` : shouldSaveAudio ? await this.saveAudioFile(chunk) : "";
+        if (chunkPath) {
+          chunkPaths.push(chunkPath);
+        }
         const result = await this.executeProcessingPipelineWithRecovery(chunk, chunkPath);
         allResults.push(result);
         this.processingState.processedChunks = i + 1;
@@ -4714,7 +4781,28 @@ var _RecordingProcessor = class {
       }
     }
     if (allResults.length > 0) {
-      await this.insertAggregatedResults(allResults, activeFile, cursorPosition);
+      try {
+        const concatenatedAudio = await this.concatenateAudioChunks(chunks);
+        const finalPath = audioFilePath || (shouldSaveAudio ? await this.saveAudioFile(concatenatedAudio) : "");
+        if (shouldSaveAudio) {
+          for (const chunkPath of chunkPaths) {
+            try {
+              await this.plugin.app.vault.adapter.remove(chunkPath);
+            } catch (error) {
+            }
+          }
+        }
+        const finalResult = {
+          transcription: allResults.map((r) => r.transcription).join("\n"),
+          summary: allResults.some((r) => r.summary) ? allResults.map((r) => r.summary).filter(Boolean).join("\n") : void 0,
+          timings: this.calculateTimings(),
+          audioFilePath: finalPath,
+          audioBlob: concatenatedAudio
+        };
+        await this.insertResults(finalResult, activeFile, cursorPosition);
+      } catch (error) {
+        await this.insertAggregatedResults(allResults, activeFile, cursorPosition);
+      }
     } else {
       throw new Error("No chunks were successfully processed");
     }
@@ -4965,15 +5053,16 @@ var import_obsidian3 = require("obsidian");
 var AIModels = {
   ["openai" /* OpenAI */]: [
     { id: "whisper-1", name: "OpenAI", category: "transcription" },
-    { id: "gpt-4o", name: "GPT 4o", category: "language", maxTokens: 8192 },
-    { id: "gpt-4o-mini", name: "GPT 4o Mini", category: "language", maxTokens: 4096 },
-    { id: "o1-preview", name: "o1 Preview", category: "language", maxTokens: 2048 },
-    { id: "o1-mini", name: "o1 Mini", category: "language", maxTokens: 1024 }
+    { id: "gpt-4o", name: "GPT 4o", category: "language", maxTokens: 16e3 },
+    { id: "gpt-4o-mini", name: "GPT 4o Mini", category: "language", maxTokens: 16e3 },
+    { id: "o1-2024-12-17", name: "o1", category: "language", maxTokens: 1e5 },
+    { id: "o1-mini-2024-09-12", name: "o1 Mini", category: "language", maxTokens: 66e3 },
+    { id: "o3-mini-2025-31", name: "o3 Mini", category: "language", maxTokens: 1e5 }
   ],
   ["groq" /* Groq */]: [
     { id: "distil-whisper-large-v3-en", name: "Groq", category: "transcription" },
     { id: "gemma2-9b-it", name: "Gemma 2 9B IT", category: "language", maxTokens: 4096 },
-    { id: "gemma-7b-it", name: "Gemma 7B IT", category: "language", maxTokens: 2048 },
+    { id: "deepseek-r1-distill-llama-70b", name: "r1", category: "language", maxTokens: 8192 },
     { id: "llama3-groq-70b-8192-tool-use-preview", name: "Llama 3 Groq 70B Versatile", category: "language", maxTokens: 8192 },
     { id: "llama3-groq-8b-8192-tool-use-preview", name: "Llama 3 Groq 8B Instant", category: "language", maxTokens: 4096 },
     { id: "llama-3.1-70b-versatile", name: "Llama 3.1 70b", category: "language", maxTokens: 8192 },
@@ -4994,7 +5083,17 @@ var AIAdapter = class {
   constructor(settings, provider) {
     this.settings = settings;
     this.provider = provider;
+    this.keyValidated = false;
+    this.lastValidatedKey = "";
     this.models = AIModels[provider];
+  }
+  setApiKey(key) {
+    const currentKey = this.getApiKey();
+    if (key !== currentKey) {
+      this.keyValidated = false;
+      this.lastValidatedKey = "";
+    }
+    this.setApiKeyInternal(key);
   }
   async generateResponse(prompt, model, options) {
     try {
@@ -5018,7 +5117,7 @@ var AIAdapter = class {
     }
   }
   async transcribeAudio(audioArrayBuffer, model) {
-    var _a, _b, _c, _d, _e, _f, _g, _h;
+    var _a, _b, _c, _d, _e, _f;
     try {
       const { headers, body } = await this.prepareTranscriptionRequest(audioArrayBuffer, model);
       const endpoint = `${this.getApiBaseUrl()}${this.getTranscriptionEndpoint()}`;
@@ -5031,18 +5130,11 @@ var AIAdapter = class {
         );
         return this.parseTranscriptionResponse(response);
       } catch (error) {
-        console.error("\u{1F399}\uFE0F Transcription Error:", {
-          endpoint,
-          model,
-          error: error == null ? void 0 : error.message,
-          response: (_a = error == null ? void 0 : error.response) == null ? void 0 : _a.data,
-          status: (_b = error == null ? void 0 : error.response) == null ? void 0 : _b.status
-        });
-        if (((_c = error == null ? void 0 : error.response) == null ? void 0 : _c.status) === 400) {
-          throw new Error(`Invalid request format: ${((_f = (_e = (_d = error == null ? void 0 : error.response) == null ? void 0 : _d.data) == null ? void 0 : _e.error) == null ? void 0 : _f.message) || "Check audio format and model name"}`);
-        } else if (((_g = error == null ? void 0 : error.response) == null ? void 0 : _g.status) === 401) {
+        if (((_a = error == null ? void 0 : error.response) == null ? void 0 : _a.status) === 400) {
+          throw new Error(`Invalid request format: ${((_d = (_c = (_b = error == null ? void 0 : error.response) == null ? void 0 : _b.data) == null ? void 0 : _c.error) == null ? void 0 : _d.message) || "Check audio format and model name"}`);
+        } else if (((_e = error == null ? void 0 : error.response) == null ? void 0 : _e.status) === 401) {
           throw new Error("Invalid API key or unauthorized access");
-        } else if (((_h = error == null ? void 0 : error.response) == null ? void 0 : _h.status) === 413) {
+        } else if (((_f = error == null ? void 0 : error.response) == null ? void 0 : _f.status) === 413) {
           throw new Error("Audio file too large. Maximum size is 25MB");
         }
         throw error;
@@ -5054,12 +5146,27 @@ var AIAdapter = class {
   }
   async validateApiKey() {
     try {
-      if (!this.getApiKey()) {
+      const currentKey = this.getApiKey();
+      if (!currentKey) {
+        this.keyValidated = false;
+        this.lastValidatedKey = "";
         return false;
       }
+      if (this.keyValidated && this.lastValidatedKey === currentKey) {
+        return true;
+      }
       const isValid = await this.validateApiKeyImpl();
+      if (isValid) {
+        this.keyValidated = true;
+        this.lastValidatedKey = currentKey;
+      } else {
+        this.keyValidated = false;
+        this.lastValidatedKey = "";
+      }
       return isValid;
     } catch (error) {
+      this.keyValidated = false;
+      this.lastValidatedKey = "";
       return false;
     }
   }
@@ -5067,22 +5174,17 @@ var AIAdapter = class {
     return this.models.filter((model) => model.category === category);
   }
   isReady(category = "transcription") {
-    return Boolean(this.getApiKey());
+    const currentKey = this.getApiKey();
+    if (!currentKey)
+      return false;
+    return this.keyValidated && this.lastValidatedKey === currentKey;
   }
   async makeAPIRequest(endpoint, method, headers, body) {
-    var _a, _b, _c;
     try {
       const requestHeaders = {
         "Authorization": `Bearer ${this.getApiKey()}`,
         ...headers
       };
-      console.log("\u{1F680} Making API request:", {
-        endpoint,
-        method,
-        headers: Object.keys(requestHeaders),
-        bodyType: body instanceof ArrayBuffer ? "ArrayBuffer" : typeof body,
-        bodySize: body instanceof ArrayBuffer ? body.byteLength : typeof body === "string" ? body.length : 0
-      });
       const response = await (0, import_obsidian3.requestUrl)({
         url: endpoint,
         method,
@@ -5091,35 +5193,16 @@ var AIAdapter = class {
         throw: true
       });
       if (!response.json) {
-        console.error("\u274C Invalid response format:", response);
         throw new Error("Invalid response format");
       }
-      console.log("\u2705 API response received:", {
-        status: response.status,
-        statusText: response.status.toString(),
-        headers: response.headers
-      });
       return response.json;
     } catch (error) {
-      console.error("\u274C API request failed:", {
-        endpoint,
-        method,
-        error: error == null ? void 0 : error.message,
-        status: (_a = error == null ? void 0 : error.response) == null ? void 0 : _a.status,
-        response: (_b = error == null ? void 0 : error.response) == null ? void 0 : _b.data,
-        headers: (_c = error == null ? void 0 : error.response) == null ? void 0 : _c.headers
-      });
       throw error;
     }
   }
   async prepareTranscriptionRequest(audioArrayBuffer, model) {
     const boundary = "boundary";
     const encoder = new TextEncoder();
-    console.log("\u{1F399}\uFE0F Preparing transcription request:", {
-      model,
-      audioSize: audioArrayBuffer.byteLength,
-      boundary
-    });
     const parts = [];
     parts.push(encoder.encode(`--${boundary}\r
 `));
@@ -5252,7 +5335,9 @@ var ModelHookupAccordion = class extends BaseAccordion {
   }
   render() {
     const openaiSetting = new import_obsidian5.Setting(this.contentEl).setName("OpenAI API Key").setDesc("Enter your OpenAI API key").addText((text) => {
-      text.setPlaceholder("sk-...").setValue(this.settings.openaiApiKey).onChange(async (value) => {
+      text.setPlaceholder("sk-...").setValue(this.settings.openaiApiKey);
+      text.inputEl.type = "password";
+      text.onChange(async (value) => {
         const trimmedValue = value.trim();
         this.settings.openaiApiKey = trimmedValue;
         await this.plugin.saveSettings();
@@ -5275,7 +5360,9 @@ var ModelHookupAccordion = class extends BaseAccordion {
       });
     });
     const groqSetting = new import_obsidian5.Setting(this.contentEl).setName("Groq API Key").setDesc("Enter your Groq API key").addText((text) => {
-      text.setPlaceholder("gsk_...").setValue(this.settings.groqApiKey).onChange(async (value) => {
+      text.setPlaceholder("gsk_...").setValue(this.settings.groqApiKey);
+      text.inputEl.type = "password";
+      text.onChange(async (value) => {
         const trimmedValue = value.trim();
         this.settings.groqApiKey = trimmedValue;
         await this.plugin.saveSettings();
@@ -5402,10 +5489,11 @@ var RecordingAccordion = class extends BaseAccordion {
     });
   }
   createTranscriptionModelSetting() {
-    new import_obsidian6.Setting(this.contentEl).setName("Transcription model").setDesc("Select the AI model for transcription").addDropdown((dropdown) => {
+    const setting = new import_obsidian6.Setting(this.contentEl).setName("Transcription model").setDesc("Select the AI model for transcription").addDropdown((dropdown) => {
       this.modelDropdown = dropdown;
       this.populateModelDropdown(dropdown);
-      dropdown.setValue(this.settings.transcriptionModel).onChange(async (value) => {
+      dropdown.setValue(this.settings.transcriptionModel);
+      dropdown.onChange(async (value) => {
         this.settings.transcriptionModel = value;
         const provider = this.getProviderFromModel(value);
         if (provider) {
@@ -5416,7 +5504,8 @@ var RecordingAccordion = class extends BaseAccordion {
     });
   }
   populateModelDropdown(dropdown) {
-    dropdown.selectEl.empty();
+    let hasModels = false;
+    const options = {};
     ["openai" /* OpenAI */, "groq" /* Groq */].forEach((provider) => {
       const apiKey = this.settings[`${provider}ApiKey`];
       if (apiKey) {
@@ -5424,28 +5513,22 @@ var RecordingAccordion = class extends BaseAccordion {
         if (adapter) {
           const models = adapter.getAvailableModels("transcription");
           if (models.length > 0) {
-            this.addModelGroup(dropdown, `${provider.toUpperCase()} Models`, models);
+            hasModels = true;
+            options[`${provider.toUpperCase()}_HEADER`] = `--- ${provider.toUpperCase()} Models ---`;
+            models.forEach((model) => {
+              options[model.id] = model.name;
+            });
           }
         }
       }
     });
-    if (dropdown.selectEl.options.length === 0) {
-      dropdown.addOption("none", "No API keys configured");
+    if (!hasModels) {
+      options["none"] = "No API keys configured";
       dropdown.setDisabled(true);
     } else {
       dropdown.setDisabled(false);
     }
-  }
-  addModelGroup(dropdown, groupName, models) {
-    const group = document.createElement("optgroup");
-    group.label = groupName;
-    models.forEach((model) => {
-      const option = document.createElement("option");
-      option.value = model.id;
-      option.text = model.name;
-      group.appendChild(option);
-    });
-    dropdown.selectEl.appendChild(group);
+    dropdown.addOptions(options);
   }
   getProviderFromModel(modelId) {
     for (const [provider, models] of Object.entries(AIModels)) {
@@ -5871,210 +5954,94 @@ var AudioRecordingManager = class {
   constructor() {
     this.recorder = null;
     this.stream = null;
-    // Add backup blob storage
-    this.recordingBackup = null;
-    this.backupInterval = null;
     this.AUDIO_CONFIG = {
       type: "audio",
-      mimeType: "audio/wav",
-      // Reverted to WAV format
+      mimeType: "audio/webm;codecs=pcm",
+      // Use PCM encoding for better quality
       recorderType: import_recordrtc.default.StereoAudioRecorder,
       numberOfAudioChannels: 1,
-      // Set to single audio channel
       desiredSampRate: 44100,
-      // Set sample rate to 44100 Hz
-      // Note: RecordRTC does not provide a direct option for bits per sample.
+      // CD quality audio
       timeSlice: 1e3
-      // ...existing code...
+      // Update each second
     };
   }
   /**
    * Initializes the recording manager with microphone access
    */
   async initialize() {
-    var _a;
     try {
-      if (!((_a = navigator.mediaDevices) == null ? void 0 : _a.getUserMedia)) {
-        throw new Error("Browser does not support audio recording");
-      }
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
           noiseSuppression: true,
-          autoGainControl: true,
-          // Optimize for voice
-          channelCount: 1,
-          sampleRate: 44100
+          autoGainControl: true
         }
       });
-      const audioTracks = this.stream.getAudioTracks();
-      if (audioTracks.length === 0) {
-        throw new Error("No audio track available");
-      }
-      this.recorder = new import_recordrtc.default(this.stream, {
-        ...this.AUDIO_CONFIG,
-        timeSlice: 1e3,
-        ondataavailable: (blob) => {
-          this.recordingBackup = blob;
-        }
-      });
+      this.recorder = new import_recordrtc.default(this.stream, this.AUDIO_CONFIG);
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : "Unknown error";
-      if (error instanceof Error) {
-        switch (error.name) {
-          case "NotAllowedError":
-            throw new Error("Microphone access denied by user");
-          case "NotFoundError":
-            throw new Error("No microphone found");
-          case "NotReadableError":
-            throw new Error("Microphone is already in use");
-          default:
-            throw new Error(`Failed to access microphone: ${errorMessage}`);
-        }
-      }
-      throw new Error("Failed to initialize recording system");
+      throw new Error("Failed to access microphone");
     }
   }
-  /**
-   * Starts audio recording without enforcing a maximum duration
-   */
   start() {
     if (!this.recorder) {
       throw new Error("Audio recorder not initialized");
     }
     this.recorder.startRecording();
   }
-  /**
-   * Pauses audio recording
-   */
   pause() {
     if (!this.recorder)
       return;
     this.recorder.pauseRecording();
   }
-  /**
-   * Resumes audio recording
-   */
   resume() {
     if (!this.recorder)
       return;
     this.recorder.resumeRecording();
   }
-  /**
-   * Stops recording with enhanced error handling and resource cleanup
-   * 🎯 Mobile-optimized with proper error handling and resource management
-   */
   async stop() {
-    if (!this.recorder) {
-      return this.recordingBackup;
-    }
-    if (this.recorder.state === "inactive") {
-      return this.recordingBackup;
-    }
-    let isStoppingInProgress = false;
-    return new Promise((resolve, reject) => {
-      try {
-        if (isStoppingInProgress) {
-          return;
-        }
-        isStoppingInProgress = true;
-        const timeoutId = setTimeout(() => {
-          this.cleanup();
-          resolve(this.recordingBackup);
-        }, 5e3);
-        this.recorder.stopRecording(async () => {
-          var _a;
-          try {
-            clearTimeout(timeoutId);
-            let blob = null;
-            try {
-              blob = ((_a = this.recorder) == null ? void 0 : _a.getBlob()) || null;
-              if (!blob) {
-                throw new Error("Failed to get recording blob");
-              }
-              Object.defineProperty(blob, "name", {
-                value: `recording-${new Date().getTime()}.wav`,
-                writable: true
-              });
-              if (blob.size === 0) {
-                blob = this.recordingBackup;
-              }
-            } catch (error) {
-              this.cleanup();
-              resolve(this.recordingBackup);
-              return;
-            }
-            this.cleanup();
-            resolve(blob);
-          } catch (error) {
-            this.cleanup();
-            resolve(this.recordingBackup);
-          }
-        });
-      } catch (error) {
-        this.cleanup();
-        resolve(this.recordingBackup);
+    if (!this.recorder)
+      return null;
+    return new Promise((resolve) => {
+      if (!this.recorder) {
+        resolve(null);
+        return;
       }
+      this.recorder.stopRecording(() => {
+        var _a;
+        const blob = ((_a = this.recorder) == null ? void 0 : _a.getBlob()) || null;
+        if (blob) {
+          Object.defineProperty(blob, "name", {
+            value: `recording-${new Date().getTime()}.wav`,
+            writable: true
+          });
+        }
+        resolve(blob);
+      });
     });
   }
-  /**
-   * Cleans up recording resources with enhanced error handling
-   * 🧹 Aggressively cleans up resources to prevent memory leaks
-   */
   cleanup() {
     if (this.recorder) {
       try {
-        if (this.recorder.state !== "inactive") {
-          this.recorder.stopRecording();
-        }
         this.recorder.destroy();
       } catch (error) {
-      } finally {
-        this.recorder = null;
       }
+      this.recorder = null;
     }
     if (this.stream) {
       try {
-        const tracks = this.stream.getTracks();
-        tracks.forEach((track) => {
-          var _a;
-          try {
-            track.stop();
-            (_a = this.stream) == null ? void 0 : _a.removeTrack(track);
-          } catch (error) {
-          }
-        });
-      } finally {
-        this.stream = null;
-      }
-    }
-    if (window.gc) {
-      try {
-        window.gc();
+        this.stream.getTracks().forEach((track) => track.stop());
       } catch (error) {
       }
+      this.stream = null;
     }
-    if (this.backupInterval) {
-      clearInterval(this.backupInterval);
-      this.backupInterval = null;
-    }
-    this.recordingBackup = null;
   }
-  /**
-   * Gets the current state of the audio recorder
-   */
   getState() {
     return this.recorder ? this.recorder.state : "inactive";
   }
-  /**
-   * Checks if the recorder is currently recording
-   */
   isRecording() {
     return this.getState() === "recording";
   }
-  /**
-   * Checks if the recorder has been initialized
-   */
   isInitialized() {
     return this.recorder !== null;
   }
@@ -6492,23 +6459,159 @@ var import_obsidian13 = require("obsidian");
 var import_obsidian12 = require("obsidian");
 
 // src/ui/RecordingUI.ts
+var import_obsidian11 = require("obsidian");
+
+// src/ui/TouchableButton.ts
 var import_obsidian10 = require("obsidian");
+var TouchableButton = class extends import_obsidian10.ButtonComponent {
+  constructor(options) {
+    super(options.container);
+    this.isProcessingAction = false;
+    this.DEBOUNCE_TIME = 1e3;
+    this.actionTimeout = null;
+    this.setupButton(options);
+  }
+  setupButton(options) {
+    this.setButtonText(options.text);
+    if (options.icon) {
+      (0, import_obsidian10.setIcon)(this.buttonEl, options.icon);
+    }
+    if (options.classes) {
+      options.classes.forEach((cls) => this.buttonEl.addClass(cls));
+    }
+    if (options.ariaLabel) {
+      this.buttonEl.setAttribute("aria-label", options.ariaLabel);
+    }
+    if (options.isCta) {
+      this.setCta();
+    }
+    this.buttonEl.addClass("touch-button");
+    this.buttonEl.setAttribute("data-state", "ready");
+    this.buttonEl.setAttribute("role", "button");
+    this.buttonEl.setAttribute("tabindex", "0");
+    this.setupTouchHandlers(options.onClick);
+  }
+  setupTouchHandlers(onClick) {
+    let touchStartTime = 0;
+    let isLongPress = false;
+    const handleTouchStart = (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (this.isProcessingAction)
+        return;
+      touchStartTime = Date.now();
+      isLongPress = false;
+      this.buttonEl.addClass("is-touching");
+      setTimeout(() => {
+        if (this.buttonEl.matches(":active")) {
+          isLongPress = true;
+          this.buttonEl.addClass("is-long-press");
+        }
+      }, 500);
+    };
+    const handleTouchEnd = async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      this.buttonEl.removeClass("is-touching");
+      this.buttonEl.removeClass("is-long-press");
+      if (this.isProcessingAction || isLongPress)
+        return;
+      const touchDuration = Date.now() - touchStartTime;
+      if (touchDuration > 1e3)
+        return;
+      await this.processButtonAction(onClick);
+    };
+    const handleTouchCancel = () => {
+      this.buttonEl.removeClass("is-touching");
+      this.buttonEl.removeClass("is-long-press");
+    };
+    this.buttonEl.addEventListener("touchstart", handleTouchStart, { passive: false });
+    this.buttonEl.addEventListener("touchend", handleTouchEnd, { passive: false });
+    this.buttonEl.addEventListener("touchcancel", handleTouchCancel);
+    this.onClick(async (e) => {
+      e.preventDefault();
+      if (!this.isProcessingAction) {
+        await this.processButtonAction(onClick);
+      }
+    });
+  }
+  /**
+   * Processes button actions with proper state management and feedback
+   * 🎯 Handles action processing with proper cleanup
+   */
+  async processButtonAction(onClick) {
+    if (this.isProcessingAction)
+      return;
+    this.buttonEl.setAttribute("data-state", "processing");
+    this.buttonEl.addClass("is-processing");
+    this.isProcessingAction = true;
+    try {
+      if (this.actionTimeout) {
+        clearTimeout(this.actionTimeout);
+      }
+      await onClick();
+      this.actionTimeout = setTimeout(() => {
+        this.isProcessingAction = false;
+        this.buttonEl.setAttribute("data-state", "ready");
+        this.buttonEl.removeClass("is-processing");
+      }, this.DEBOUNCE_TIME);
+    } catch (error) {
+      this.isProcessingAction = false;
+      this.buttonEl.setAttribute("data-state", "error");
+      this.buttonEl.addClass("has-error");
+      setTimeout(() => {
+        this.buttonEl.setAttribute("data-state", "ready");
+        this.buttonEl.removeClass("has-error");
+      }, 2e3);
+    }
+  }
+  /**
+   * Cleanup resources and event listeners
+   */
+  cleanup() {
+    if (this.actionTimeout) {
+      clearTimeout(this.actionTimeout);
+      this.actionTimeout = null;
+    }
+    this.buttonEl.remove();
+  }
+};
+
+// src/ui/RecordingUI.ts
 var RecordingUI = class {
   constructor(container, handlers) {
     this.container = container;
     this.handlers = handlers;
     this.currentState = "inactive";
-    this.isProcessingAction = false;
-    this.DEBOUNCE_TIME = 1e3;
-    // 1 second debounce
-    this.actionTimeout = null;
     this.initializeComponents();
     window.addEventListener("unload", () => this.cleanup());
   }
   initializeComponents() {
+    this.setupTouchHandlers();
     this.createTimerDisplay();
     this.createControls();
     this.createWaveform();
+  }
+  /**
+   * Sets up touch event handlers for mobile interactions
+   * 📱 Prevents unwanted gestures and ensures smooth interaction
+   */
+  setupTouchHandlers() {
+    this.container.addEventListener("gesturestart", (e) => {
+      e.preventDefault();
+    }, { passive: false });
+    this.container.addEventListener("touchmove", (e) => {
+      e.preventDefault();
+    }, { passive: false });
+    let lastTap = 0;
+    this.container.addEventListener("touchend", (e) => {
+      const currentTime = new Date().getTime();
+      const tapLength = currentTime - lastTap;
+      if (tapLength < 300 && tapLength > 0) {
+        e.preventDefault();
+      }
+      lastTap = currentTime;
+    }, { passive: false });
   }
   createTimerDisplay() {
     this.timerText = this.container.createDiv({
@@ -6520,20 +6623,22 @@ var RecordingUI = class {
     const controls = this.container.createDiv({
       cls: "neurovox-timer-controls"
     });
-    this.pauseButton = this.createButton(
-      controls,
-      ["neurovox-timer-button", "neurovox-pause-button"],
-      "pause",
-      "Pause recording",
-      () => this.handlers.onPause()
-    );
-    this.stopButton = this.createButton(
-      controls,
-      ["neurovox-timer-button", "neurovox-stop-button"],
-      "square",
-      "Stop Recording",
-      () => this.handlers.onStop()
-    );
+    this.pauseButton = new TouchableButton({
+      container: controls,
+      text: "",
+      icon: "pause",
+      classes: ["neurovox-timer-button", "neurovox-pause-button"],
+      ariaLabel: "Pause recording",
+      onClick: () => this.handlers.onPause()
+    });
+    this.stopButton = new TouchableButton({
+      container: controls,
+      text: "",
+      icon: "square",
+      classes: ["neurovox-timer-button", "neurovox-stop-button"],
+      ariaLabel: "Stop Recording",
+      onClick: () => this.handlers.onStop()
+    });
   }
   createWaveform() {
     this.waveContainer = this.container.createDiv({
@@ -6544,52 +6649,6 @@ var RecordingUI = class {
         cls: "neurovox-wave-bar"
       });
     }
-  }
-  /**
-   * Creates a button with debouncing and error handling
-   * 🛡️ Mobile-optimized with protection against rapid clicks
-   */
-  createButton(container, classNames, iconName, ariaLabel, onClick) {
-    const button = container.createEl("button", {
-      cls: classNames,
-      attr: {
-        "aria-label": ariaLabel,
-        "data-state": "ready"
-      }
-    });
-    (0, import_obsidian10.setIcon)(button, iconName);
-    button.addEventListener("click", async (e) => {
-      e.preventDefault();
-      if (this.isProcessingAction) {
-        return;
-      }
-      button.setAttribute("data-state", "processing");
-      button.addClass("is-processing");
-      this.isProcessingAction = true;
-      try {
-        if (this.actionTimeout) {
-          clearTimeout(this.actionTimeout);
-        }
-        await onClick();
-        this.actionTimeout = setTimeout(() => {
-          this.isProcessingAction = false;
-          button.setAttribute("data-state", "ready");
-          button.removeClass("is-processing");
-        }, this.DEBOUNCE_TIME);
-      } catch (error) {
-        this.isProcessingAction = false;
-        button.setAttribute("data-state", "error");
-        button.addClass("has-error");
-        setTimeout(() => {
-          button.setAttribute("data-state", "ready");
-          button.removeClass("has-error");
-        }, 2e3);
-      }
-    });
-    button.addEventListener("touchstart", (e) => {
-      e.preventDefault();
-    }, { passive: false });
-    return button;
   }
   updateTimer(seconds, maxDuration, warningThreshold) {
     const minutes = Math.floor(seconds / 60).toString().padStart(2, "0");
@@ -6606,88 +6665,20 @@ var RecordingUI = class {
     const isPaused = state === "paused";
     const iconName = isPaused ? "play" : "pause";
     const label = isPaused ? "Resume recording" : "Pause Recording";
-    this.pauseButton.empty();
-    (0, import_obsidian10.setIcon)(this.pauseButton, iconName);
-    this.pauseButton.setAttribute("aria-label", label);
-    this.pauseButton.toggleClass("is-paused", isPaused);
+    this.pauseButton.buttonEl.empty();
+    (0, import_obsidian11.setIcon)(this.pauseButton.buttonEl, iconName);
+    this.pauseButton.buttonEl.setAttribute("aria-label", label);
+    this.pauseButton.buttonEl.toggleClass("is-paused", isPaused);
   }
   /**
    * Enhanced cleanup with proper resource management
    * 🧹 Ensures all resources are properly released
    */
   cleanup() {
-    if (this.actionTimeout) {
-      clearTimeout(this.actionTimeout);
-      this.actionTimeout = null;
-    }
-    this.isProcessingAction = false;
-    if (this.pauseButton) {
-      this.pauseButton.remove();
-    }
-    if (this.stopButton) {
-      this.stopButton.remove();
-    }
+    var _a, _b;
+    (_a = this.pauseButton) == null ? void 0 : _a.cleanup();
+    (_b = this.stopButton) == null ? void 0 : _b.cleanup();
     this.container.empty();
-  }
-};
-
-// src/modals/ConfirmationModal.ts
-var import_obsidian11 = require("obsidian");
-var ConfirmationModal = class extends import_obsidian11.Modal {
-  constructor(app, options) {
-    super(app);
-    this.options = {
-      title: "Recording Options",
-      confirmText: "Save and Process",
-      processOnlyText: "Process Only",
-      cancelText: "Cancel",
-      ...options
-    };
-    this.result = new Promise((resolve) => {
-      this.resolvePromise = resolve;
-    });
-    this.modalEl.addEventListener("click", (event2) => {
-      if (event2.target === this.modalEl) {
-        this.resolvePromise(2 /* Cancel */);
-        this.close();
-      }
-    });
-  }
-  onOpen() {
-    const { contentEl } = this;
-    contentEl.empty();
-    contentEl.addClass("neurovox-confirmation-modal");
-    contentEl.createEl("h2", { text: this.options.title });
-    contentEl.createEl("p", { text: this.options.message });
-    const buttonContainer = contentEl.createDiv({
-      cls: "neurovox-confirmation-buttons"
-    });
-    new import_obsidian11.ButtonComponent(buttonContainer).setButtonText(this.options.cancelText).setClass("neurovox-button-secondary").onClick(() => {
-      this.resolvePromise(2 /* Cancel */);
-      this.close();
-    });
-    new import_obsidian11.ButtonComponent(buttonContainer).setButtonText(this.options.processOnlyText).setClass("neurovox-button-warning").onClick(() => {
-      this.resolvePromise(1 /* ProcessOnly */);
-      this.close();
-    });
-    new import_obsidian11.ButtonComponent(buttonContainer).setButtonText(this.options.confirmText).setClass("neurovox-button-primary").setCta().onClick(() => {
-      this.resolvePromise(0 /* SaveAndProcess */);
-      this.close();
-    });
-  }
-  /**
-   * Gets the user's choice from the confirmation dialog
-   * @returns Promise resolving to true if confirmed, false if cancelled
-   */
-  async getResult() {
-    return this.result;
-  }
-  onClose() {
-    const { contentEl } = this;
-    contentEl.empty();
-    if (this.resolvePromise) {
-      this.resolvePromise(2 /* Cancel */);
-    }
   }
 };
 
@@ -6708,19 +6699,30 @@ var TimerModal = class extends import_obsidian12.Modal {
     this.setupCloseHandlers();
   }
   /**
-   * Sets up handlers for modal closing via escape key and clicking outside
+   * Sets up handlers for modal closing via escape key, clicks, and touch events
+   * 📱 Enhanced with proper mobile touch handling
    */
   setupCloseHandlers() {
-    this.modalEl.addEventListener("click", (event2) => {
-      if (event2.target === this.modalEl) {
+    this.contentEl.addEventListener("touchstart", (e) => {
+      e.stopPropagation();
+    }, { passive: true });
+    const handleOutsideInteraction = (event2) => {
+      const target = event2.target;
+      if (target === this.modalEl) {
         event2.preventDefault();
         event2.stopPropagation();
-        this.requestClose();
+        void this.requestClose();
       }
-    });
+    };
+    this.modalEl.addEventListener("click", handleOutsideInteraction);
+    this.modalEl.addEventListener("touchstart", handleOutsideInteraction, { passive: false });
+    this.modalEl.addEventListener("touchend", (e) => e.preventDefault(), { passive: false });
     this.scope.register([], "Escape", () => {
-      this.requestClose();
+      void this.requestClose();
       return false;
+    });
+    window.addEventListener("popstate", () => {
+      void this.requestClose();
     });
   }
   /**
@@ -6753,13 +6755,24 @@ var TimerModal = class extends import_obsidian12.Modal {
     super.close();
   }
   /**
-   * Initializes the modal and starts recording
+   * Initializes the modal with enhanced mobile support
+   * 📱 Added mobile-specific meta tags and initialization
    */
   async onOpen() {
     try {
+      const viewport = document.querySelector('meta[name="viewport"]');
+      if (!viewport) {
+        const meta = document.createElement("meta");
+        meta.name = "viewport";
+        meta.content = "width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no";
+        document.head.appendChild(meta);
+      }
       const { contentEl } = this;
       contentEl.empty();
       contentEl.addClass("neurovox-timer-modal");
+      if (this.isMobileDevice()) {
+        contentEl.addClass("is-mobile");
+      }
       const container = contentEl.createDiv({
         cls: "neurovox-timer-content"
       });
@@ -6767,11 +6780,38 @@ var TimerModal = class extends import_obsidian12.Modal {
         onPause: () => this.handlePauseToggle(),
         onStop: () => this.handleStop()
       });
-      await this.recordingManager.initialize();
-      await this.startRecording();
+      await this.initializeRecording();
     } catch (error) {
       this.handleError("Failed to initialize recording", error);
     }
+  }
+  /**
+   * Initializes recording with mobile-specific handling
+   * 📱 Added device-specific audio configuration
+   */
+  async initializeRecording() {
+    try {
+      await this.recordingManager.initialize();
+      await this.startRecording();
+    } catch (error) {
+      if (this.isIOSDevice() && error instanceof Error && error.name === "NotAllowedError") {
+        this.handleError("iOS requires microphone permission. Please enable it in Settings.", error);
+      } else {
+        this.handleError("Failed to initialize recording", error);
+      }
+    }
+  }
+  /**
+   * Detects if current device is mobile using Obsidian's Platform API
+   */
+  isMobileDevice() {
+    return import_obsidian12.Platform.isMobile;
+  }
+  /**
+   * Detects if current device is iOS using Obsidian's Platform API
+   */
+  isIOSDevice() {
+    return import_obsidian12.Platform.isIosApp || import_obsidian12.Platform.isMobile && /iPhone|iPad|iPod/i.test(navigator.userAgent);
   }
   /**
    * Starts or resumes recording
@@ -6827,28 +6867,9 @@ var TimerModal = class extends import_obsidian12.Modal {
       }
       this.cleanup();
       super.close();
-      const confirmModal = new ConfirmationModal(this.app, {
-        title: "Save Recording",
-        message: "Would you like to save the audio file?",
-        confirmText: "Save & Process",
-        processOnlyText: "Process Only",
-        cancelText: "Cancel"
-      });
-      confirmModal.open();
-      const result = await confirmModal.getResult();
-      switch (result) {
-        case 0 /* SaveAndProcess */:
-          if (this.onStop) {
-            await this.onStop(blob, true);
-          }
-          break;
-        case 1 /* ProcessOnly */:
-          if (this.onStop) {
-            await this.onStop(blob, false);
-          }
-          break;
-        case 2 /* Cancel */:
-          break;
+      if (this.onStop) {
+        const settings = this.app.plugins.plugins["neurovox"].settings;
+        await this.onStop(blob, settings.saveRecording);
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : "Unknown error";
@@ -6939,7 +6960,7 @@ var ToolbarButton = class {
    */
   createButton() {
     this.ribbonIconEl = this.plugin.addRibbonIcon(
-      "microphone",
+      "mic-vocal",
       "Start recording",
       (evt) => {
         this.openRecordingModal();
@@ -6983,11 +7004,11 @@ var OpenAIAdapter = class extends AIAdapter {
     super(settings, "openai" /* OpenAI */);
     this.apiKey = "";
   }
-  setApiKey(key) {
-    this.apiKey = key;
-  }
   getApiKey() {
     return this.apiKey;
+  }
+  setApiKeyInternal(key) {
+    this.apiKey = key;
   }
   getApiBaseUrl() {
     return "https://api.openai.com/v1";
@@ -7041,11 +7062,11 @@ var GroqAdapter = class extends AIAdapter {
     super(settings, "groq" /* Groq */);
     this.apiKey = "";
   }
-  setApiKey(key) {
-    this.apiKey = key;
-  }
   getApiKey() {
     return this.apiKey;
+  }
+  setApiKeyInternal(key) {
+    this.apiKey = key;
   }
   getApiBaseUrl() {
     return "https://api.groq.com/openai/v1";
@@ -7068,7 +7089,7 @@ var GroqAdapter = class extends AIAdapter {
           "Content-Type": "application/json"
         },
         JSON.stringify({
-          model: "gemma2-9b-it",
+          model: "mixtral-8x7b-32768",
           messages: [{ role: "user", content: "test" }],
           max_tokens: 1
         })
@@ -7112,11 +7133,33 @@ var NeuroVoxPlugin = class extends import_obsidian14.Plugin {
   async initializePlugin() {
     await this.loadPluginData();
     this.initializeAIAdapters();
+    await this.validateApiKeys();
     this.registerSettingsTab();
     this.registerCommands();
     this.registerEvents();
     this.recordingProcessor = RecordingProcessor.getInstance(this, this.pluginData);
     this.initializeUI();
+  }
+  async validateApiKeys() {
+    try {
+      const openaiAdapter = this.aiAdapters.get("openai" /* OpenAI */);
+      const groqAdapter = this.aiAdapters.get("groq" /* Groq */);
+      if (openaiAdapter) {
+        openaiAdapter.setApiKey(this.settings.openaiApiKey);
+        await openaiAdapter.validateApiKey();
+      }
+      if (groqAdapter) {
+        groqAdapter.setApiKey(this.settings.groqApiKey);
+        await groqAdapter.validateApiKey();
+      }
+      if (openaiAdapter && !openaiAdapter.isReady() && this.settings.openaiApiKey) {
+        new import_obsidian14.Notice("\u274C OpenAI API key validation failed");
+      }
+      if (groqAdapter && !groqAdapter.isReady() && this.settings.groqApiKey) {
+        new import_obsidian14.Notice("\u274C Groq API key validation failed");
+      }
+    } catch (error) {
+    }
   }
   async loadPluginData() {
     const data = await this.loadData();

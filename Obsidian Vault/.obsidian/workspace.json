@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Investigate to network protocol/Investigate To Network Protocols.md",
+                "file": "Write a report demonstrating your understanding of the Threat Intelligence Life Cycle/Planning Direction.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Investigate To Network Protocols"
+              "title": "Planning Direction"
             }
           }
         ]
@@ -155,6 +155,8 @@
   },
   "left-ribbon": {
     "hiddenItems": {
+      "zk-prefixer:Create new unique note": false,
+      "audio-recorder:Start/stop recording": false,
       "switcher:Open quick switcher": false,
       "graph:Open graph view": false,
       "canvas:Create new canvas": false,
@@ -166,6 +168,9 @@
   "active": "c4a12ed69b09bdb4",
   "lastOpenFiles": [
     "Investigate to network protocol/Investigate To Network Protocols.md",
+    "Write a report demonstrating your understanding of the Threat Intelligence Life Cycle/Planning Direction.md",
+    "Investigate to network protocol/Untitled.md",
+    "Write a report demonstrating your understanding of the Threat Intelligence Life Cycle",
     "Investigate to network protocol"
   ]
 }
