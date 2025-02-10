@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "Write a report demonstrating your understanding of the Threat Intelligence Life Cycle/Planning Direction.md",
+                "file": "MISP/TryHackme.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "Planning Direction"
+              "title": "TryHackme"
             }
           }
         ]
@@ -167,8 +167,11 @@
   },
   "active": "c4a12ed69b09bdb4",
   "lastOpenFiles": [
-    "Investigate to network protocol/Investigate To Network Protocols.md",
+    "Write a report demonstrating your understanding of the Threat Intelligence Life Cycle/Untitled.md",
+    "MISP/TryHackme.md",
     "Write a report demonstrating your understanding of the Threat Intelligence Life Cycle/Planning Direction.md",
+    "MISP",
+    "Investigate to network protocol/Investigate To Network Protocols.md",
     "Investigate to network protocol/Untitled.md",
     "Write a report demonstrating your understanding of the Threat Intelligence Life Cycle",
     "Investigate to network protocol"
